@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
-Friendly SQL Browser
+Newbie Friendly SQL Browser
 
-Open any .sql dump, finish the sentence at the top ("Show me every ... where
-... is ..."), click a result on the left, and read everything connected to it
-on the right.
-
-    python sql_browser.py              (asks which file to open)
-    python sql_browser.py mydb.sql
+Open any .sql dump (doesn't need to be in the same folder) and put together queries for results.
 
 Needs Python 3.8+ only. Keep sqlcore.py in the same folder.
 Friendly names for columns can be changed with alias_admin.py.
@@ -90,7 +85,7 @@ class FilterRow:
 class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
-        self.title("Friendly SQL Browser")
+        self.title("SQL Browser")
         self.geometry("1200x720")
         self.minsize(900, 560)
         self.db = None

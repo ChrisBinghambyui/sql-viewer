@@ -2,29 +2,7 @@
 """
 Name Editor for the Friendly SQL Browser.
 
-Open a .sql file, double-click any table or column, and type the name people
-should see. Everything is saved to aliases.json (next to this script), which
-sql_browser.py reads each time it opens a file.
-
-    python alias_admin.py              (asks which file to open)
-    python alias_admin.py mydb.sql
-
-aliases.json looks like this, so you can also edit it by hand:
-
-{
-  "mydb.sql": {
-    "tables":  {"enemy_type": "Monster"},
-    "columns": {"customers.fname": "Fart Name", "fname": "Fart Name"},
-    "words":   {"qty": "quantity"}
-  },
-  "*": { "words": {"cust": "client"} }
-}
-
- - tables:  table name -> shown name
- - columns: "table.column" -> shown name, or just "column" for every table
- - words:   a short word or abbreviation -> what it means (used inside any
-            column name, like the built-in fname -> first name list)
- - "*":     applies to every file; a file's own entry wins over "*"
+Select an sql file and edit any of the generated names as desired. Handles most common names (fname is read as First Name), but it's not omnipotent.
 """
 import json
 import sys

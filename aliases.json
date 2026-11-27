@@ -1,0 +1,8 @@
+{
+  "mydb_dump_1.sql": {
+    "columns": {
+      "ability_name": "Ability Name",
+      "ability_shape": "Ability Shape"
+    }
+  }
+}

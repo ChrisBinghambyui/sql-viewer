@@ -1,10 +1,7 @@
 """
-sqlcore.py - the engine behind the Friendly SQL Browser.
+sqlcore.py - the engine behind the SQL Browser.
 
-Reads a .sql dump (MySQL style, and most SQLite/generic dumps), rebuilds it in
-an in-memory SQLite database, works out how the tables connect, and offers
-plain-English names, searches, and "everything about this row" summaries.
-No UI code lives here, so it can be tested or reused on its own.
+Does all the work for the other two of interpreting and running sql queries.
 """
 import json
 import re
@@ -48,9 +45,6 @@ ACRONYMS = {"id": "ID", "url": "URL", "hp": "HP", "sku": "SKU", "ssn": "SSN",
 SMALL_WORDS = {"of", "and", "the", "to", "in", "on", "for", "a"}
 
 
-# --------------------------------------------------------------------------
-# Tokenising and parsing the dump
-# --------------------------------------------------------------------------
 TOKEN = re.compile(
     r"""('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*"|`[^`]*`)"""   # 1 quoted bit
     r"""|(--[^\n]*|/\*.*?\*/)"""                                 # 2 comment
@@ -201,9 +195,6 @@ def fmt(v):
     return {"true": "Yes", "false": "No"}.get(s.lower(), s)
 
 
-# --------------------------------------------------------------------------
-# Friendly names
-# --------------------------------------------------------------------------
 class Aliases:
     """Looks up display names. Order: this file's overrides, then the '*'
     (all files) overrides, then the built-in abbreviation list."""
@@ -270,9 +261,6 @@ def load_alias_file():
         return {}
 
 
-# --------------------------------------------------------------------------
-# Schema objects
-# --------------------------------------------------------------------------
 class Col:
     def __init__(self, name, sqltype):
         self.name, self.type, self.affinity = name, sqltype, affinity(sqltype)
@@ -323,9 +311,6 @@ class Table:
         return self.info or ([] if self.fks else list(self.cols))
 
 
-# --------------------------------------------------------------------------
-# The database
-# --------------------------------------------------------------------------
 class Database:
     def __init__(self, path):
         self.path = Path(path)
@@ -351,7 +336,6 @@ class Database:
             raise ValueError("I could not find any tables in that file.")
         self._finish()
 
-    # ---- loading --------------------------------------------------------
     def _find(self, name):
         for t in self.tables:
             if t.lower() == name.lower():
@@ -495,7 +479,6 @@ class Database:
                 last = next((c for b, c in bases if b in ("last_name", "lastname", "lname", "surname")), None)
                 t.last_col = last.name if last else None
 
-    # ---- names ----------------------------------------------------------
     def role(self, t, fk):
         """What a link means, e.g. 'Faction' or 'Minimum Material Tier'."""
         base = re.sub(r"_?id$", "", strip_prefix(fk.cols[0], t.name), flags=re.I)
@@ -516,7 +499,6 @@ class Database:
         names = [n for n in self.tables if counts[n]] or list(self.tables)
         return sorted(names, key=lambda n: self.tables[n].is_link)
 
-    # ---- row access -----------------------------------------------------
     def parent_row(self, fk, row):
         vals = [row[c] for c in fk.cols]
         if any(v is None for v in vals):
@@ -583,7 +565,6 @@ class Database:
         p = self.parent_row(fk, row)
         return self.label(fk.ref, p) if p is not None else ""
 
-    # ---- searching ------------------------------------------------------
     def fields_for(self, root, max_hops=2):
         """Everything the person can filter this table by, including facts
         stored in linked tables (up to max_hops links away)."""
@@ -703,7 +684,6 @@ class Database:
             shown = shown.replace("?", repr(p), 1)
         return sql, params, shown
 
-    # ---- the "everything about this" panel ------------------------------
     def brief(self, tn, row):
         """One short line describing a row: its name plus up to three facts."""
         t = self.tables[tn]
