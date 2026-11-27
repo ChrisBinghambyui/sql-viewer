@@ -1,7 +1,7 @@
 """
 sqlcore.py - the engine behind the SQL Browser.
 
-Does all the work for the other two of interpreting and running sql queries.
+Does all the work for the other two of interpreting, running, and modifying sql queries.
 """
 import json
 import re
@@ -195,6 +195,18 @@ def fmt(v):
     return {"true": "Yes", "false": "No"}.get(s.lower(), s)
 
 
+def sql_literal(v):
+    """Format a Python value as a safe SQL literal for .sql dump export."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v).replace("'", "''")
+    return "'%s'" % s
+
+
 class Aliases:
     """Looks up display names. Order: this file's overrides, then the '*'
     (all files) overrides, then the built-in abbreviation list."""
@@ -262,8 +274,11 @@ def load_alias_file():
 
 
 class Col:
-    def __init__(self, name, sqltype):
-        self.name, self.type, self.affinity = name, sqltype, affinity(sqltype)
+    def __init__(self, name, sqltype, notnull=False):
+        self.name = name
+        self.type = sqltype
+        self.affinity = affinity(sqltype)
+        self.notnull = notnull
 
 
 class FK:
@@ -285,6 +300,7 @@ class Table:
         self.cols, self.pk, self.fks = [], [], []
         self.name_col = None
         self.last_col = None   # surname column, when name_col is a first name
+        self.raw_ddl = ""      # original CREATE TABLE statement if loaded from .sql
 
     @property
     def fk_cols(self):
@@ -317,24 +333,79 @@ class Database:
         self.aliases = Aliases(self.path.name)
         self.tables, self.reverse = {}, {}
         self._labels, self._shown = {}, set()
-        self.conn = sqlite3.connect(":memory:")
-        self.conn.row_factory = sqlite3.Row
-        raw = self.path.read_bytes()
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("latin-1")
-        for st in split_statements(text):
-            head = st[:12].upper()
-            if head.startswith("CREATE"):
-                self._create(st)
-            elif head.startswith(("INSERT", "REPLACE")):
-                self._insert(st)
-            elif head.startswith("ALTER"):
-                self._alter(st)
-        if not self.tables:
-            raise ValueError("I could not find any tables in that file.")
+        self.dirty = False
+        self.other_statements = []  # preserved non-table DDL (indexes, views, triggers, etc.)
+
+        is_sqlite = False
+        if self.path.exists():
+            header = self.path.read_bytes()[:16]
+            if header.startswith(b"SQLite format 3"):
+                is_sqlite = True
+
+        if is_sqlite:
+            self.is_sqlite_file = True
+            self.conn = sqlite3.connect(str(self.path))
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self._load_from_sqlite()
+        else:
+            self.is_sqlite_file = False
+            self.conn = sqlite3.connect(":memory:")
+            self.conn.row_factory = sqlite3.Row
+            raw = self.path.read_bytes()
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = raw.decode("latin-1")
+            for st in split_statements(text):
+                head = st[:12].upper()
+                if head.startswith("CREATE"):
+                    if re.match(r"^CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b", st, re.I):
+                        self._create(st)
+                    else:
+                        self.other_statements.append(st)
+                elif head.startswith(("INSERT", "REPLACE")):
+                    self._insert(st)
+                elif head.startswith("ALTER"):
+                    self._alter(st)
+            if not self.tables:
+                raise ValueError("I could not find any tables in that file.")
         self._finish()
+        if not self.is_sqlite_file:
+            # Enable FK enforcement after dump import is complete
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _load_from_sqlite(self):
+        rows = self.conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for r in rows:
+            tn = r["name"]
+            t = Table(tn)
+            t.raw_ddl = r["sql"] or ""
+            cols = self.conn.execute('PRAGMA table_info("%s")' % tn).fetchall()
+            pk_cols = []
+            for c in cols:
+                t.cols.append(Col(c["name"], c["type"] or "", bool(c["notnull"])))
+                if c["pk"]:
+                    pk_cols.append((c["pk"], c["name"]))
+            pk_cols.sort()
+            t.pk = [name for _, name in pk_cols]
+
+            fk_rows = self.conn.execute('PRAGMA foreign_key_list("%s")' % tn).fetchall()
+            fk_groups = {}
+            for fk in fk_rows:
+                fk_groups.setdefault(fk["id"], {"ref": fk["table"], "pairs": []})["pairs"].append(
+                    (fk["seq"], fk["from"], fk["to"])
+                )
+            for info in fk_groups.values():
+                info["pairs"].sort()
+                cols_from = [p[1] for p in info["pairs"]]
+                cols_to = [p[2] for p in info["pairs"]]
+                t.fks.append(FK(tn, cols_from, info["ref"], cols_to))
+            self.tables[tn] = t
+        if not self.tables:
+            raise ValueError("I could not find any tables in that SQLite database.")
 
     def _find(self, name):
         for t in self.tables:
@@ -368,7 +439,8 @@ class Database:
             if not m:
                 return
             name = unquote(m.group(1))
-            t.cols.append(Col(name, m.group(2)))
+            notnull = bool(re.search(r"\bNOT\s+NULL\b", up))
+            t.cols.append(Col(name, m.group(2), notnull=notnull))
             if re.search(r"\bPRIMARY\s+KEY\b", up):
                 t.pk = [name]
             r = re.search(r"\bREFERENCES\s+((?:%s\s*\.\s*)?%s)\s*(?:\(([^)]*)\))?" % (IDENT, IDENT), p, re.I)
@@ -386,12 +458,26 @@ class Database:
         start = m.end() - 1
         end = match_paren(st, start)
         t = Table(name)
+        t.raw_ddl = st
         for p in split_top(st[start + 1:end]):
             self._part(t, p)
         if not t.cols:
             return
-        ddl = 'CREATE TABLE "%s" (%s)' % (
-            name, ",".join('"%s" %s' % (c.name, c.affinity) for c in t.cols))
+
+        col_defs = []
+        for c in t.cols:
+            is_single_int_pk = (len(t.pk) == 1 and t.pk[0].lower() == c.name.lower() and c.affinity == "INTEGER")
+            if is_single_int_pk:
+                col_defs.append('"%s" INTEGER PRIMARY KEY' % c.name)
+            else:
+                nn = " NOT NULL" if c.notnull else ""
+                col_defs.append('"%s" %s%s' % (c.name, c.affinity, nn))
+
+        if len(t.pk) > 1 or (len(t.pk) == 1 and not any(
+                c.name.lower() == t.pk[0].lower() and c.affinity == "INTEGER" for c in t.cols)):
+            col_defs.append("PRIMARY KEY (%s)" % ", ".join('"%s"' % p for p in t.pk))
+
+        ddl = 'CREATE TABLE "%s" (%s)' % (name, ", ".join(col_defs))
         try:
             self.conn.execute(ddl)
         except sqlite3.Error:
@@ -479,6 +565,199 @@ class Database:
                 last = next((c for b, c in bases if b in ("last_name", "lastname", "lname", "surname")), None)
                 t.last_col = last.name if last else None
 
+    # ---- CRUD & Persistence ---------------------------------------------
+
+    def _coerce_value(self, col_obj, val):
+        """Convert form text into an appropriate Python/SQLite value."""
+        if val is None:
+            return None
+        if isinstance(val, str):
+            s = val.strip()
+            if s == "":
+                return None
+            if col_obj.affinity == "INTEGER":
+                if s.lower() in ("yes", "true"):
+                    return 1
+                if s.lower() in ("no", "false"):
+                    return 0
+                try:
+                    return int(s)
+                except ValueError:
+                    try:
+                        f = float(s)
+                        if f.is_integer():
+                            return int(f)
+                    except ValueError:
+                        pass
+                    raise ValueError('"%s" must be a whole number for "%s".' % (s, col_obj.name))
+            elif col_obj.affinity == "REAL":
+                try:
+                    return float(s)
+                except ValueError:
+                    raise ValueError('"%s" must be a number for "%s".' % (s, col_obj.name))
+            return s
+        return val
+
+    def fk_choices(self, fk):
+        """Return [(ref_key_value, human_label)] for populating FK dropdowns."""
+        ref_col = fk.ref_cols[0]
+        rows = self.conn.execute(
+            'SELECT rowid AS "__rid", * FROM "%s" ORDER BY rowid' % fk.ref
+        ).fetchall()
+        choices = []
+        for r in rows:
+            val = r[ref_col]
+            if val is not None:
+                choices.append((val, self.label(fk.ref, r)))
+        choices.sort(key=lambda item: item[1].lower())
+        return choices
+
+    def child_reference_count(self, tn, row):
+        """Count how many child rows in other tables point to this row."""
+        total = 0
+        for ct, fk in self.reverse.get(tn, []):
+            total += len(self.children(fk, row))
+        return total
+
+    def insert_row(self, tn, values):
+        """Insert a new record into table `tn` from {col_name: raw_value}. Returns new rowid."""
+        t = self.tables[tn]
+        col_map = {c.name: c for c in t.cols}
+        cols, params = [], []
+        for cname, raw_val in values.items():
+            if cname not in col_map:
+                continue
+            coerced = self._coerce_value(col_map[cname], raw_val)
+            # Omit None for an integer primary key so SQLite auto-assigns it
+            if coerced is None and len(t.pk) == 1 and t.pk[0] == cname and col_map[cname].affinity == "INTEGER":
+                continue
+            cols.append(cname)
+            params.append(coerced)
+
+        if cols:
+            sql = 'INSERT INTO "%s" (%s) VALUES (%s)' % (
+                tn,
+                ", ".join('"%s"' % c for c in cols),
+                ", ".join("?" * len(cols)),
+            )
+        else:
+            sql = 'INSERT INTO "%s" DEFAULT VALUES' % tn
+
+        try:
+            cur = self.conn.execute(sql, params)
+            self.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Database constraint failed: %s" % exc)
+        except sqlite3.Error as exc:
+            raise ValueError("Could not insert row: %s" % exc)
+
+        self._labels.clear()
+        self.dirty = True
+        return cur.lastrowid
+
+    def update_row(self, tn, rowid, values):
+        """Update an existing record identified by `rowid` in table `tn`."""
+        t = self.tables[tn]
+        col_map = {c.name: c for c in t.cols}
+        sets, params = [], []
+        for cname, raw_val in values.items():
+            if cname not in col_map:
+                continue
+            coerced = self._coerce_value(col_map[cname], raw_val)
+            sets.append('"%s" = ?' % cname)
+            params.append(coerced)
+
+        if not sets:
+            return
+        params.append(rowid)
+        sql = 'UPDATE "%s" SET %s WHERE rowid = ?' % (tn, ", ".join(sets))
+        try:
+            self.conn.execute(sql, params)
+            self.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Database constraint failed: %s" % exc)
+        except sqlite3.Error as exc:
+            raise ValueError("Could not update row: %s" % exc)
+
+        self._labels.clear()
+        self.dirty = True
+
+    def delete_row(self, tn, rowid):
+        """Delete a record identified by `rowid` from table `tn`."""
+        sql = 'DELETE FROM "%s" WHERE rowid = ?' % tn
+        try:
+            self.conn.execute(sql, (rowid,))
+            self.conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Cannot delete this record because other records depend on it (%s)." % exc)
+        except sqlite3.Error as exc:
+            raise ValueError("Could not delete row: %s" % exc)
+
+        self._labels.clear()
+        self.dirty = True
+
+    def save(self, target_path=None):
+        """Persist current database state to disk (as .sqlite/.db or .sql dump)."""
+        out_path = Path(target_path) if target_path else self.path
+        ext = out_path.suffix.lower()
+
+        if ext in (".sqlite", ".sqlite3", ".db"):
+            if self.is_sqlite_file and out_path.resolve() == self.path.resolve():
+                self.conn.commit()
+            else:
+                dest = sqlite3.connect(str(out_path))
+                try:
+                    self.conn.backup(dest)
+                    dest.commit()
+                finally:
+                    dest.close()
+                self.path = out_path
+                self.is_sqlite_file = True
+                self.aliases = Aliases(self.path.name)
+            self.dirty = False
+            return out_path
+
+        # Export as a .sql dump preserving original CREATE TABLE DDL where available
+        lines = ["-- Exported by SQL Browser", ""]
+        for tn, t in self.tables.items():
+            if t.raw_ddl:
+                ddl = t.raw_ddl.strip()
+                if not ddl.endswith(";"):
+                    ddl += ";"
+                lines.append(ddl)
+            else:
+                col_defs = ['"%s" %s' % (c.name, c.type or c.affinity) for c in t.cols]
+                if t.pk:
+                    col_defs.append("PRIMARY KEY (%s)" % ", ".join('"%s"' % p for p in t.pk))
+                lines.append('CREATE TABLE "%s" (\n  %s\n);' % (tn, ",\n  ".join(col_defs)))
+            lines.append("")
+
+            col_names = [c.name for c in t.cols]
+            quoted_cols = ", ".join('"%s"' % c for c in col_names)
+            rows = self.conn.execute(
+                'SELECT %s FROM "%s" ORDER BY rowid' % (quoted_cols, tn)
+            ).fetchall()
+            if rows:
+                for r in rows:
+                    vals = ", ".join(sql_literal(r[c]) for c in col_names)
+                    lines.append('INSERT INTO "%s" (%s) VALUES (%s);' % (tn, quoted_cols, vals))
+                lines.append("")
+
+        for st in self.other_statements:
+            s = st.strip()
+            if not s.endswith(";"):
+                s += ";"
+            lines.append(s)
+
+        out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        self.path = out_path
+        self.is_sqlite_file = False
+        self.aliases = Aliases(self.path.name)
+        self.dirty = False
+        return out_path
+
+    # ---- Querying & Formatting ------------------------------------------
+
     def role(self, t, fk):
         """What a link means, e.g. 'Faction' or 'Minimum Material Tier'."""
         base = re.sub(r"_?id$", "", strip_prefix(fk.cols[0], t.name), flags=re.I)
@@ -493,10 +772,8 @@ class Database:
         return name
 
     def table_choices(self):
-        """Tables worth offering in the picker: ones with data, main tables first."""
-        counts = {n: self.conn.execute('SELECT COUNT(*) FROM "%s"' % n).fetchone()[0]
-                  for n in self.tables}
-        names = [n for n in self.tables if counts[n]] or list(self.tables)
+        """Tables worth offering in the picker: main tables first."""
+        names = list(self.tables)
         return sorted(names, key=lambda n: self.tables[n].is_link)
 
     def parent_row(self, fk, row):

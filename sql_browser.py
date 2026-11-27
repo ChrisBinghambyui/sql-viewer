@@ -12,11 +12,170 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
-from sqlcore import BLANK_OPS, OPS, Database
+from sqlcore import BLANK_OPS, OPS, Database, fmt
 
 MAX_FILTERS = 4
 MAX_DEPTH_TAGS = 8
 INDENT = 22
+
+
+class RecordDialog(tk.Toplevel):
+    """Modal dialog for inserting a new record or editing an existing one."""
+
+    def __init__(self, parent, db, table_name, existing_row=None):
+        super().__init__(parent)
+        self.db = db
+        self.table_name = table_name
+        self.table_obj = db.tables[table_name]
+        self.existing_row = existing_row
+        self.saved = False
+        self.result_rowid = existing_row["__rid"] if existing_row is not None else None
+
+        pretty_tbl = db.aliases.pretty_table(table_name)
+        if existing_row is None:
+            self.title("New %s" % pretty_tbl)
+        else:
+            self.title("Edit %s — %s" % (pretty_tbl, db.label(table_name, existing_row)))
+
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(True, True)
+        self.minsize(480, 260)
+
+        # Map column names -> FK object (for single-column FKs)
+        self.fk_by_col = {}
+        for fk in self.table_obj.fks:
+            if len(fk.cols) == 1:
+                self.fk_by_col[fk.cols[0]] = fk
+
+        self.widgets = {}      # col_name -> (kind, widget, extra_data)
+        self._build_form()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.wait_visibility()
+        self.focus_set()
+
+    def _build_form(self):
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        # Scrollable canvas in case a table has many columns
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        form = ttk.Frame(canvas, padding=(4, 4, 12, 4))
+
+        form.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=form, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        pk_set = {p.lower() for p in self.table_obj.pk}
+        first_focus = None
+
+        for r_idx, col in enumerate(self.table_obj.cols):
+            cname = col.name
+            is_pk = cname.lower() in pk_set
+            is_auto_int_pk = (
+                is_pk and len(self.table_obj.pk) == 1 and col.affinity == "INTEGER"
+            )
+
+            label_text = self.db.aliases.pretty_col(self.table_name, cname)
+            if cname in self.fk_by_col:
+                label_text = self.db.role(self.table_obj, self.fk_by_col[cname])
+            if col.notnull and not is_auto_int_pk:
+                label_text += " *"
+
+            lbl = ttk.Label(form, text=label_text + ":", anchor="e")
+            lbl.grid(row=r_idx, column=0, sticky="e", padx=(0, 10), pady=5)
+
+            cur_val = self.existing_row[cname] if self.existing_row is not None else None
+
+            if cname in self.fk_by_col:
+                fk = self.fk_by_col[cname]
+                choices = self.db.fk_choices(fk)
+                display_list = ["(None)"]
+                label_to_id = {"(None)": None}
+                id_to_label = {None: "(None)"}
+                for raw_id, human_lbl in choices:
+                    disp = "%s [#%s]" % (human_lbl, fmt(raw_id))
+                    display_list.append(disp)
+                    label_to_id[disp] = raw_id
+                    id_to_label[raw_id] = disp
+
+                cmb = ttk.Combobox(form, values=display_list, state="readonly", width=36)
+                if cur_val in id_to_label:
+                    cmb.set(id_to_label[cur_val])
+                elif cur_val is not None:
+                    fallback = "(Unknown #%s)" % fmt(cur_val)
+                    cmb["values"] = [fallback] + display_list
+                    label_to_id[fallback] = cur_val
+                    cmb.set(fallback)
+                else:
+                    cmb.set("(None)")
+                cmb.grid(row=r_idx, column=1, sticky="ew", pady=5)
+                self.widgets[cname] = ("fk", cmb, label_to_id)
+                if first_focus is None:
+                    first_focus = cmb
+
+            elif is_auto_int_pk:
+                if self.existing_row is None:
+                    ent = ttk.Entry(form, width=38)
+                    ent.insert(0, "(auto-assigned)")
+                    ent.state(["disabled"])
+                    ent.grid(row=r_idx, column=1, sticky="ew", pady=5)
+                    self.widgets[cname] = ("auto_pk", ent, None)
+                else:
+                    ent = ttk.Entry(form, width=38)
+                    ent.insert(0, fmt(cur_val))
+                    ent.state(["readonly"])
+                    ent.grid(row=r_idx, column=1, sticky="ew", pady=5)
+                    self.widgets[cname] = ("readonly_pk", ent, cur_val)
+            else:
+                ent = ttk.Entry(form, width=38)
+                if cur_val is not None:
+                    ent.insert(0, fmt(cur_val))
+                ent.grid(row=r_idx, column=1, sticky="ew", pady=5)
+                self.widgets[cname] = ("entry", ent, None)
+                if first_focus is None:
+                    first_focus = ent
+
+        form.columnconfigure(1, weight=1)
+
+        btn_bar = ttk.Frame(self, padding=(14, 6, 14, 14))
+        btn_bar.pack(fill="x")
+        ttk.Button(btn_bar, text="Save Record", style="Big.TButton", command=self._on_save).pack(side="right")
+        ttk.Button(btn_bar, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        if first_focus is not None:
+            first_focus.focus_set()
+
+    def _collect_values(self):
+        values = {}
+        for cname, (kind, widget, extra) in self.widgets.items():
+            if kind == "auto_pk":
+                values[cname] = None
+            elif kind == "readonly_pk":
+                values[cname] = extra
+            elif kind == "fk":
+                values[cname] = extra.get(widget.get())
+            else:
+                values[cname] = widget.get()
+        return values
+
+    def _on_save(self):
+        values = self._collect_values()
+        try:
+            if self.existing_row is None:
+                self.result_rowid = self.db.insert_row(self.table_name, values)
+            else:
+                self.db.update_row(self.table_name, self.existing_row["__rid"], values)
+        except ValueError as exc:
+            messagebox.showerror("Cannot Save Record", str(exc), parent=self)
+            return
+        self.saved = True
+        self.destroy()
 
 
 class FilterRow:
@@ -86,8 +245,8 @@ class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
         self.title("SQL Browser")
-        self.geometry("1200x720")
-        self.minsize(900, 560)
+        self.geometry("1220x740")
+        self.minsize(920, 580)
         self.db = None
         self.table = None
         self.fields, self.groups = [], {}
@@ -98,6 +257,7 @@ class App(tk.Tk):
         self.deep_var = tk.BooleanVar(value=False)
         self._setup_style()
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         if path:
             self.load(path)
         else:
@@ -126,8 +286,20 @@ class App(tk.Tk):
         top = ttk.Frame(self, padding=(12, 10, 12, 4))
         top.pack(fill="x")
         ttk.Button(top, text="Open a file...", command=self.open_dialog).pack(side="left")
+        self.save_btn = ttk.Button(top, text="Save", command=self.save_file)
+        self.save_btn.pack(side="left", padx=(6, 0))
+        self.save_as_btn = ttk.Button(top, text="Save As...", command=self.save_file_as)
+        self.save_as_btn.pack(side="left", padx=(6, 0))
         self.file_lbl = ttk.Label(top, text="(no file open)", foreground="#555")
-        self.file_lbl.pack(side="left", padx=10)
+        self.file_lbl.pack(side="left", padx=12)
+
+        # Record editing toolbar on the right side of the top bar
+        self.del_btn = ttk.Button(top, text="Delete", command=self.delete_record)
+        self.del_btn.pack(side="right")
+        self.edit_btn = ttk.Button(top, text="Edit Selected...", command=self.edit_record)
+        self.edit_btn.pack(side="right", padx=(0, 6))
+        self.new_btn = ttk.Button(top, text="+ New Record...", command=self.new_record)
+        self.new_btn.pack(side="right", padx=(0, 6))
 
         box = ttk.LabelFrame(self, text=" What would you like to see? ", padding=10)
         box.pack(fill="x", padx=12, pady=6)
@@ -163,6 +335,8 @@ class App(tk.Tk):
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Double-1>", lambda e: self.edit_record())
+        self.tree.bind("<Delete>", lambda e: self.delete_record())
         panes.add(left, weight=2)
 
         right = ttk.Frame(panes)
@@ -192,12 +366,95 @@ class App(tk.Tk):
         self.sql_lbl = ttk.Label(self, text="", foreground="#666", wraplength=1100,
                                  font=("Courier", 10), padding=(12, 0, 12, 8))
         self.after(300, lambda: panes.sashpos(0, int(self.winfo_width() * 0.4)))
+        self._update_action_states()
         self.message("Pick something to look for above, then click a result on the left.")
+
+    # ---- state & persistence --------------------------------------------
+    def _update_title_and_file_label(self):
+        if not self.db:
+            self.file_lbl.config(text="(no file open)")
+            self.title("SQL Browser")
+            return
+        mark = " *" if self.db.dirty else ""
+        self.file_lbl.config(text=self.db.path.name + mark)
+        self.title("SQL Browser — %s%s" % (self.db.path.name, mark))
+
+    def _update_action_states(self):
+        has_db = self.db is not None
+        has_sel = has_db and bool(self.tree.selection())
+        self.save_btn.state(["!disabled" if has_db else "disabled"])
+        self.save_as_btn.state(["!disabled" if has_db else "disabled"])
+        self.new_btn.state(["!disabled" if has_db else "disabled"])
+        self.edit_btn.state(["!disabled" if has_sel else "disabled"])
+        self.del_btn.state(["!disabled" if has_sel else "disabled"])
+
+    def _confirm_discard_changes(self):
+        if not self.db or not self.db.dirty:
+            return True
+        ans = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            'Save changes to "%s" before continuing?' % self.db.path.name,
+            parent=self,
+        )
+        if ans is None:
+            return False
+        if ans is True:
+            return self.save_file()
+        return True
+
+    def on_close(self):
+        if self._confirm_discard_changes():
+            self.destroy()
+
+    def save_file(self):
+        if not self.db:
+            return False
+        try:
+            self.db.save()
+        except Exception as exc:
+            messagebox.showerror("Save Failed", str(exc), parent=self)
+            return False
+        self._update_title_and_file_label()
+        self.status.config(text='Saved to "%s".' % self.db.path.name, foreground="#1b5e20")
+        return True
+
+    def save_file_as(self):
+        if not self.db:
+            return False
+        path = filedialog.asksaveasfilename(
+            title="Save Database As",
+            initialfile=self.db.path.name,
+            defaultextension=self.db.path.suffix or ".sql",
+            filetypes=[
+                ("SQL dump", "*.sql"),
+                ("SQLite database", "*.sqlite *.db"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return False
+        try:
+            self.db.save(path)
+        except Exception as exc:
+            messagebox.showerror("Save Failed", str(exc), parent=self)
+            return False
+        self._update_title_and_file_label()
+        self.status.config(text='Saved to "%s".' % self.db.path.name, foreground="#1b5e20")
+        return True
 
     # ---- loading --------------------------------------------------------
     def open_dialog(self):
-        path = filedialog.askopenfilename(title="Open a SQL file",
-                                          filetypes=[("SQL files", "*.sql"), ("All files", "*.*")])
+        if not self._confirm_discard_changes():
+            return
+        path = filedialog.askopenfilename(
+            title="Open a SQL or SQLite file",
+            filetypes=[
+                ("SQL & SQLite files", "*.sql *.sqlite *.sqlite3 *.db"),
+                ("SQL files", "*.sql"),
+                ("SQLite files", "*.sqlite *.sqlite3 *.db"),
+                ("All files", "*.*"),
+            ],
+        )
         if path:
             self.load(path)
         elif self.db is None:
@@ -212,11 +469,79 @@ class App(tk.Tk):
                 self.after(50, self.open_dialog)
             return
         self.db = db
-        self.file_lbl.config(text=db.path.name)
+        self._update_title_and_file_label()
         self.table_names = {db.aliases.pretty_table(n): n for n in db.table_choices()}
         self.table_combo["values"] = list(self.table_names)
         self.table_combo.current(0)
         self.on_table()
+
+    # ---- CRUD actions ---------------------------------------------------
+    def new_record(self):
+        if not self.db or not self.table:
+            return
+        dlg = RecordDialog(self, self.db, self.table, existing_row=None)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self._update_title_and_file_label()
+            self._refresh_filter_suggestions()
+            self.search(select_rowid=dlg.result_rowid)
+
+    def edit_record(self):
+        if not self.db or not self.table:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            return
+        row = self.result_rows.get(sel[0])
+        if row is None:
+            return
+        dlg = RecordDialog(self, self.db, self.table, existing_row=row)
+        self.wait_window(dlg)
+        if dlg.saved:
+            self._update_title_and_file_label()
+            self._refresh_filter_suggestions()
+            self.search(select_rowid=row["__rid"])
+
+    def delete_record(self):
+        if not self.db or not self.table:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            return
+        row = self.result_rows.get(sel[0])
+        if row is None:
+            return
+
+        label = self.db.label(self.table, row)
+        pretty_tbl = self.db.aliases.pretty_table(self.table)
+        ref_count = self.db.child_reference_count(self.table, row)
+
+        msg = 'Delete %s "%s"?' % (pretty_tbl, label)
+        if ref_count:
+            msg += (
+                "\n\nWarning: %d record(s) in other tables currently link to this item. "
+                "Deleting it may fail if foreign keys are enforced or leave broken references."
+                % ref_count
+            )
+
+        if not messagebox.askyesno("Confirm Delete", msg, icon="warning", parent=self):
+            return
+
+        try:
+            self.db.delete_row(self.table, row["__rid"])
+        except ValueError as exc:
+            messagebox.showerror("Cannot Delete Record", str(exc), parent=self)
+            return
+
+        self._update_title_and_file_label()
+        self._refresh_filter_suggestions()
+        self.search()
+
+    def _refresh_filter_suggestions(self):
+        for r in self.rows:
+            f = r.current()
+            if f:
+                r.value["values"] = self.db.suggestions(f.table, f.col)
 
     # ---- the sentence ---------------------------------------------------
     def on_table(self, _event=None):
@@ -256,7 +581,7 @@ class App(tk.Tk):
         self.add_btn.state(["disabled" if len(self.rows) >= MAX_FILTERS else "!disabled"])
 
     # ---- searching ------------------------------------------------------
-    def search(self):
+    def search(self, select_rowid=None):
         if not self.db:
             return
         conds = []
@@ -288,12 +613,18 @@ class App(tk.Tk):
         self.status.config(foreground="#333", text=("1 result" if n == 1 else "%d results" % n)
                            if n else "Nothing matched. Try a different word, or remove a condition.")
         self.sql_lbl.config(text=shown)
-        if n == 0:
-            self.message("Nothing matched your search.")
+
+        target_iid = str(select_rowid) if select_rowid is not None else None
+        if target_iid and target_iid in self.result_rows:
+            self.tree.selection_set(target_iid)
+            self.tree.see(target_iid)
+        elif n == 0:
+            self.message("Nothing matched your search. Click '+ New Record...' above to add one.")
         elif n == 1:
             self.tree.selection_set(self.tree.get_children()[0])
         else:
             self.message("Click any result on the left to see everything about it here.")
+        self._update_action_states()
 
     def sort_tree(self, col, reverse):
         def key(item):
@@ -321,6 +652,7 @@ class App(tk.Tk):
         self.text.config(state="disabled")
 
     def on_select(self, _event=None):
+        self._update_action_states()
         sel = self.tree.selection()
         if not sel:
             return
